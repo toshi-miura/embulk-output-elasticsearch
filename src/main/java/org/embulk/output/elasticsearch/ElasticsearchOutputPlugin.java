@@ -1,9 +1,12 @@
 package org.embulk.output.elasticsearch;
 
-import com.google.common.base.Optional;
-import com.google.common.base.Throwables;
-import com.google.common.collect.ImmutableList;
-import com.google.inject.Inject;
+import static com.google.common.base.Preconditions.*;
+
+import java.io.IOException;
+import java.util.Date;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
 import org.elasticsearch.action.bulk.BulkItemResponse;
 import org.elasticsearch.action.bulk.BulkProcessor;
 import org.elasticsearch.action.bulk.BulkRequest;
@@ -12,392 +15,365 @@ import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.client.Client;
 import org.elasticsearch.client.Requests;
 import org.elasticsearch.client.transport.TransportClient;
-import org.elasticsearch.common.unit.ByteSizeValue;
-import org.elasticsearch.common.unit.ByteSizeUnit;
 import org.elasticsearch.common.settings.ImmutableSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.transport.InetSocketTransportAddress;
+import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.xcontent.XContentBuilder;
 import org.elasticsearch.common.xcontent.XContentFactory;
-import org.elasticsearch.node.Node;
-import org.elasticsearch.node.NodeBuilder;
-import org.embulk.config.TaskReport;
 import org.embulk.config.Config;
 import org.embulk.config.ConfigDefault;
 import org.embulk.config.ConfigDiff;
 import org.embulk.config.ConfigSource;
 import org.embulk.config.Task;
+import org.embulk.config.TaskReport;
 import org.embulk.config.TaskSource;
 import org.embulk.spi.Column;
+import org.embulk.spi.ColumnVisitor;
 import org.embulk.spi.Exec;
 import org.embulk.spi.OutputPlugin;
 import org.embulk.spi.Page;
 import org.embulk.spi.PageReader;
 import org.embulk.spi.Schema;
-import org.embulk.spi.ColumnVisitor;
 import org.embulk.spi.TransactionalPageOutput;
 import org.slf4j.Logger;
 
-import java.io.IOException;
-import java.util.Date;
-import java.util.List;
-import java.util.concurrent.TimeUnit;
+import com.google.common.base.Optional;
+import com.google.common.base.Throwables;
+import com.google.inject.Inject;
 
-import static com.google.common.base.Preconditions.checkState;
+public class ElasticsearchOutputPlugin implements OutputPlugin {
+	private static ThreadLocal<TransportClient> threadLocal = new ThreadLocal<TransportClient>();
 
-public class ElasticsearchOutputPlugin
-        implements OutputPlugin
-{
-    public interface NodeAddressTask
-            extends Task
-    {
-        @Config("host")
-        public String getHost();
+	public interface NodeAddressTask extends Task {
+		@Config("host")
+		public String getHost();
 
-        @Config("port")
-        @ConfigDefault("9300")
-        public int getPort();
-    }
+		@Config("port")
+		@ConfigDefault("9300")
+		public int getPort();
+	}
 
-    public interface PluginTask
-            extends Task
-    {
-        @Config("nodes")
-        public List<NodeAddressTask> getNodes();
+	public interface PluginTask extends Task {
+		@Config("nodes")
+		public List<NodeAddressTask> getNodes();
 
-        @Config("cluster_name")
-        @ConfigDefault("\"elasticsearch\"")
-        public String getClusterName();
+		@Config("cluster_name")
+		@ConfigDefault("\"elasticsearch\"")
+		public String getClusterName();
 
-        @Config("index")
-        public String getIndex();
+		@Config("index")
+		public String getIndex();
 
-        @Config("index_type")
-        public String getType();
+		@Config("index_type")
+		public String getType();
 
-        @Config("id")
-        @ConfigDefault("null")
-        public Optional<String> getId();
+		@Config("id")
+		@ConfigDefault("null")
+		public Optional<String> getId();
 
-        @Config("bulk_actions")
-        @ConfigDefault("1000")
-        public int getBulkActions();
+		@Config("bulk_actions")
+		@ConfigDefault("1000")
+		public int getBulkActions();
 
-        @Config("bulk_size")
-        @ConfigDefault("5242880")
-        public long getBulkSize();
+		@Config("bulk_size")
+		@ConfigDefault("5242880")
+		public long getBulkSize();
 
-        @Config("concurrent_requests")
-        @ConfigDefault("5")
-        public int getConcurrentRequests();
-    }
+		@Config("concurrent_requests")
+		@ConfigDefault("5")
+		public int getConcurrentRequests();
+	}
 
-    private final Logger log;
+	private final Logger log;
 
-    @Inject
-    public ElasticsearchOutputPlugin()
-    {
-        log = Exec.getLogger(getClass());
-    }
+	@Inject
+	public ElasticsearchOutputPlugin() {
+		log = Exec.getLogger(getClass());
+	}
 
-    @Override
-    public ConfigDiff transaction(ConfigSource config, Schema schema,
-                                  int processorCount, Control control)
-    {
-        final PluginTask task = config.loadConfig(PluginTask.class);
+	@Override
+	public ConfigDiff transaction(ConfigSource config, Schema schema, int processorCount, Control control) {
+		final PluginTask task = config.loadConfig(PluginTask.class);
 
-        // confirm that a client can be initialized
-        try (Client client = createClient(task)) {
-        }
+		// confirm that a client can be initialized
+		try (Client client = createClient(task)) {
+		}
 
-        // check that id is included in the schema or not if the id is not null.
-        if (task.getId().isPresent()) {
-            String id = task.getId().get();
-            boolean found = false;
-            for (Column column : schema.getColumns()) {
-                if (column.equals(id)) {
-                    found = true;
-                }
-            }
-            checkState(found, "id is not included in column names of the Schema.");
-        }
+		// check that id is included in the schema or not if the id is not null.
+		if (task.getId().isPresent()) {
+			String id = task.getId().get();
+			boolean found = false;
+			for (Column column : schema.getColumns()) {
+				if (column.equals(id)) {
+					found = true;
+				}
+			}
+			checkState(found, "id is not included in column names of the Schema.");
+		}
 
-        try {
-            control.run(task.dump());
-        } catch (Exception e) {
-            throw Throwables.propagate(e);
-        }
+		try {
+			control.run(task.dump());
+		} catch (Exception e) {
+			throw Throwables.propagate(e);
+		}
 
-        ConfigDiff nextConfig = Exec.newConfigDiff();
-        return nextConfig;
-    }
+		ConfigDiff nextConfig = Exec.newConfigDiff();
+		return nextConfig;
+	}
 
-    @Override
-    public  ConfigDiff resume(TaskSource taskSource,
-                             Schema schema, int processorCount,
-                             OutputPlugin.Control control)
-    {
-        //  TODO
-        return Exec.newConfigDiff();
-    }
+	@Override
+	public ConfigDiff resume(TaskSource taskSource, Schema schema, int processorCount, OutputPlugin.Control control) {
+		// TODO
+		return Exec.newConfigDiff();
+	}
 
-    @Override
-    public void cleanup(TaskSource taskSource,
-                        Schema schema, int processorCount,
-                        List<TaskReport> successTaskReports)
-    { }
+	@Override
+	public void cleanup(TaskSource taskSource, Schema schema, int processorCount, List<TaskReport> successTaskReports) {
+	}
 
-    private Client createClient(final PluginTask task)
-    {
-        //  @see http://www.elasticsearch.org/guide/en/elasticsearch/client/java-api/current/client.html
-        Settings settings = ImmutableSettings.settingsBuilder()
-                .classLoader(Settings.class.getClassLoader())
-                .put("cluster.name", task.getClusterName())
-                .build();
-        TransportClient client = new TransportClient(settings);
-        List<NodeAddressTask> nodes = task.getNodes();
-        for (NodeAddressTask node : nodes) {
-            client.addTransportAddress(new InetSocketTransportAddress(node.getHost(), node.getPort()));
-        }
-        return client;
-    }
+	private Client createClient(final PluginTask task) {
+		// @see
+		// http://www.elasticsearch.org/guide/en/elasticsearch/client/java-api/current/client.html
 
-    private BulkProcessor newBulkProcessor(final PluginTask task, final Client client)
-    {
-        return BulkProcessor.builder(client, new BulkProcessor.Listener() {
-            @Override
-            public void beforeBulk(long executionId, BulkRequest request)
-            {
-                log.info("Execute {} bulk actions", request.numberOfActions());
-            }
+		//BADCODE !!!!
+		TransportClient client = threadLocal.get();
 
-            @Override
-            public void afterBulk(long executionId, BulkRequest request, BulkResponse response)
-            {
-                if (response.hasFailures()) {
-                    long items = 0;
-                    if (log.isDebugEnabled()) {
-                        for (BulkItemResponse item : response.getItems()) {
-                            if (item.isFailed()) {
-                                items += 1;
-                                log.debug("   Error for {}/{}/{} for {} operation: {}",
-                                        item.getIndex(), item.getType(), item.getId(),
-                                        item.getOpType(), item.getFailureMessage());
-                            }
-                        }
-                    }
-                    log.warn("{} bulk actions failed: {}", items, response.buildFailureMessage());
-                } else {
-                    log.info("{} bulk actions succeeded", request.numberOfActions());
-                }
-            }
+		if (client == null) {
+			Settings settings = ImmutableSettings.settingsBuilder().classLoader(Settings.class.getClassLoader())
+					.put("cluster.name", task.getClusterName()).build();
+			client = new TransportClient(settings);
+			List<NodeAddressTask> nodes = task.getNodes();
+			for (NodeAddressTask node : nodes) {
+				client.addTransportAddress(new InetSocketTransportAddress(node.getHost(), node.getPort()));
+			}
+			threadLocal.set(client);
+		}else{
 
-            @Override
-            public void afterBulk(long executionId, BulkRequest request, Throwable failure)
-            {
-                log.warn("Got the error during bulk processing", failure);
-            }
-        }).setBulkActions(task.getBulkActions())
-          .setBulkSize(new ByteSizeValue(task.getBulkSize()))
-          .setConcurrentRequests(task.getConcurrentRequests())
-          .build();
-    }
+		}
+		return client;
+	}
 
-    @Override
-    public TransactionalPageOutput open(TaskSource taskSource, Schema schema,
-                                        int processorIndex)
-    {
-        final PluginTask task = taskSource.loadTask(PluginTask.class);
+	private BulkProcessor newBulkProcessor(final PluginTask task, final Client client) {
+		return BulkProcessor.builder(client, new BulkProcessor.Listener() {
+			@Override
+			public void beforeBulk(long executionId, BulkRequest request) {
+				log.info("Execute {} bulk actions", request.numberOfActions());
+			}
 
-        Client client = createClient(task);
-        BulkProcessor bulkProcessor = newBulkProcessor(task, client);
-        ElasticsearchPageOutput pageOutput = new ElasticsearchPageOutput(task, client, bulkProcessor);
-        pageOutput.open(schema);
-        return pageOutput;
-    }
+			@Override
+			public void afterBulk(long executionId, BulkRequest request, BulkResponse response) {
+				if (response.hasFailures()) {
+					long items = 0;
+					if (log.isDebugEnabled()) {
+						for (BulkItemResponse item : response.getItems()) {
+							if (item.isFailed()) {
+								items += 1;
+								log.debug("   Error for {}/{}/{} for {} operation: {}", item.getIndex(), item.getType(),
+										item.getId(), item.getOpType(), item.getFailureMessage());
+							}
+						}
+					}
+					log.warn("{} bulk actions failed: {}", items, response.buildFailureMessage());
+				} else {
+					log.info("{} bulk actions succeeded", request.numberOfActions());
+				}
+			}
 
-    public static class ElasticsearchPageOutput implements TransactionalPageOutput
-    {
-        private Logger log;
+			@Override
+			public void afterBulk(long executionId, BulkRequest request, Throwable failure) {
+				log.warn("Got the error during bulk processing", failure);
+			}
+		}).setBulkActions(task.getBulkActions()).setBulkSize(new ByteSizeValue(task.getBulkSize()))
+				.setConcurrentRequests(task.getConcurrentRequests()).build();
+	}
 
-        private Client client;
-        private BulkProcessor bulkProcessor;
+	@Override
+	public TransactionalPageOutput open(TaskSource taskSource, Schema schema, int processorIndex) {
+		final PluginTask task = taskSource.loadTask(PluginTask.class);
 
-        private PageReader pageReader;
+		Client client = createClient(task);
+		BulkProcessor bulkProcessor = newBulkProcessor(task, client);
+		ElasticsearchPageOutput pageOutput = new ElasticsearchPageOutput(task, client, bulkProcessor);
+		pageOutput.open(schema);
+		return pageOutput;
+	}
 
-        private final String index;
-        private final String type;
-        private final String id;
+	public static class ElasticsearchPageOutput implements TransactionalPageOutput {
+		private Logger log;
 
-        public ElasticsearchPageOutput(PluginTask task, Client client, BulkProcessor bulkProcessor)
-        {
-            this.log = Exec.getLogger(getClass());
+		private Client client;
+		private BulkProcessor bulkProcessor;
 
-            this.client = client;
-            this.bulkProcessor = bulkProcessor;
+		private PageReader pageReader;
 
-            this.index = task.getIndex();
-            this.type = task.getType();
-            this.id = task.getId().orNull();
-        }
+		private final String index;
+		private final String type;
+		private final String id;
 
-        void open(final Schema schema)
-        {
-            pageReader = new PageReader(schema);
-        }
+		public ElasticsearchPageOutput(PluginTask task, Client client, BulkProcessor bulkProcessor) {
+			this.log = Exec.getLogger(getClass());
 
-        @Override
-        public void add(Page page)
-        {
-            pageReader.setPage(page);
+			this.client = client;
+			this.bulkProcessor = bulkProcessor;
 
-            while (pageReader.nextRecord()) {
-                try {
-                    final XContentBuilder contextBuilder = XContentFactory.jsonBuilder().startObject(); //  TODO reusable??
-                    pageReader.getSchema().visitColumns(new ColumnVisitor() {
-                        @Override
-                        public void booleanColumn(Column column) {
-                            try {
-                                if (pageReader.isNull(column)) {
-                                    contextBuilder.nullField(column.getName());
-                                } else {
-                                    contextBuilder.field(column.getName(), pageReader.getBoolean(column));
-                                }
-                            } catch (IOException e) {
-                                try {
-                                    contextBuilder.nullField(column.getName());
-                                } catch (IOException ex) {
-                                    throw Throwables.propagate(ex);
-                                }
-                            }
-                        }
+			this.index = task.getIndex();
+			this.type = task.getType();
+			this.id = task.getId().orNull();
+		}
 
-                        @Override
-                        public void longColumn(Column column) {
-                            try {
-                                if (pageReader.isNull(column)) {
-                                    contextBuilder.nullField(column.getName());
-                                } else {
-                                    contextBuilder.field(column.getName(), pageReader.getLong(column));
-                                }
-                            } catch (IOException e) {
-                                try {
-                                    contextBuilder.nullField(column.getName());
-                                } catch (IOException ex) {
-                                    throw Throwables.propagate(ex);
-                                }
-                            }
-                        }
+		void open(final Schema schema) {
+			pageReader = new PageReader(schema);
+		}
 
-                        @Override
-                        public void doubleColumn(Column column) {
-                            try {
-                                if (pageReader.isNull(column)) {
-                                    contextBuilder.nullField(column.getName());
-                                } else {
-                                    contextBuilder.field(column.getName(), pageReader.getDouble(column));
-                                }
-                            } catch (IOException e) {
-                                try {
-                                    contextBuilder.nullField(column.getName());
-                                } catch (IOException ex) {
-                                    throw Throwables.propagate(ex);
-                                }
-                            }
-                        }
+		@Override
+		public void add(Page page) {
+			pageReader.setPage(page);
 
-                        @Override
-                        public void stringColumn(Column column) {
-                            try {
-                                if (pageReader.isNull(column)) {
-                                    contextBuilder.nullField(column.getName());
-                                } else {
-                                    contextBuilder.field(column.getName(), pageReader.getString(column));
-                                }
-                            } catch (IOException e) {
-                                try {
-                                    contextBuilder.nullField(column.getName());
-                                } catch (IOException ex) {
-                                    throw Throwables.propagate(ex);
-                                }
-                            }
-                        }
+			while (pageReader.nextRecord()) {
+				try {
+					final XContentBuilder contextBuilder = XContentFactory.jsonBuilder().startObject(); // TODO
+																										// reusable??
+					pageReader.getSchema().visitColumns(new ColumnVisitor() {
+						@Override
+						public void booleanColumn(Column column) {
+							try {
+								if (pageReader.isNull(column)) {
+									contextBuilder.nullField(column.getName());
+								} else {
+									contextBuilder.field(column.getName(), pageReader.getBoolean(column));
+								}
+							} catch (IOException e) {
+								try {
+									contextBuilder.nullField(column.getName());
+								} catch (IOException ex) {
+									throw Throwables.propagate(ex);
+								}
+							}
+						}
 
-                        @Override
-                        public void timestampColumn(Column column) {
-                            try {
-                                if (pageReader.isNull(column)) {
-                                    contextBuilder.nullField(column.getName());
-                                } else {
-                                    contextBuilder.field(column.getName(), new Date(pageReader.getTimestamp(column).toEpochMilli()));
-                                }
-                            } catch (IOException e) {
-                                try {
-                                    contextBuilder.nullField(column.getName());
-                                } catch (IOException ex) {
-                                    throw Throwables.propagate(ex);
-                                }
-                            }
-                        }
-                    });
+						@Override
+						public void longColumn(Column column) {
+							try {
+								if (pageReader.isNull(column)) {
+									contextBuilder.nullField(column.getName());
+								} else {
+									contextBuilder.field(column.getName(), pageReader.getLong(column));
+								}
+							} catch (IOException e) {
+								try {
+									contextBuilder.nullField(column.getName());
+								} catch (IOException ex) {
+									throw Throwables.propagate(ex);
+								}
+							}
+						}
 
-                    contextBuilder.endObject();
-                    bulkProcessor.add(newIndexRequest().source(contextBuilder));
+						@Override
+						public void doubleColumn(Column column) {
+							try {
+								if (pageReader.isNull(column)) {
+									contextBuilder.nullField(column.getName());
+								} else {
+									contextBuilder.field(column.getName(), pageReader.getDouble(column));
+								}
+							} catch (IOException e) {
+								try {
+									contextBuilder.nullField(column.getName());
+								} catch (IOException ex) {
+									throw Throwables.propagate(ex);
+								}
+							}
+						}
 
-                } catch (IOException e) {
-                    Throwables.propagate(e); //  TODO error handling
-                }
-            }
-        }
+						@Override
+						public void stringColumn(Column column) {
+							try {
+								if (pageReader.isNull(column)) {
+									contextBuilder.nullField(column.getName());
+								} else {
+									contextBuilder.field(column.getName(), pageReader.getString(column));
+								}
+							} catch (IOException e) {
+								try {
+									contextBuilder.nullField(column.getName());
+								} catch (IOException ex) {
+									throw Throwables.propagate(ex);
+								}
+							}
+						}
 
-        private IndexRequest newIndexRequest()
-        {
-            return Requests.indexRequest(index).type(type).id(id);
-        }
+						@Override
+						public void timestampColumn(Column column) {
+							try {
+								if (pageReader.isNull(column)) {
+									contextBuilder.nullField(column.getName());
+								} else {
+									contextBuilder.field(column.getName(),
+											new Date(pageReader.getTimestamp(column).toEpochMilli()));
+								}
+							} catch (IOException e) {
+								try {
+									contextBuilder.nullField(column.getName());
+								} catch (IOException ex) {
+									throw Throwables.propagate(ex);
+								}
+							}
+						}
+					});
 
-        @Override
-        public void finish()
-        {
-            try {
-                bulkProcessor.flush();
-            } finally {
-                close();
-            }
-        }
+					contextBuilder.endObject();
+					bulkProcessor.add(newIndexRequest().source(contextBuilder));
 
-        @Override
-        public void close()
-        {
-            if (bulkProcessor != null) {
-                try {
-                    while (!bulkProcessor.awaitClose(3, TimeUnit.SECONDS)) {
-                        log.debug("wait for closing the bulk processing..");
-                    }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-                bulkProcessor = null;
-            }
+				} catch (IOException e) {
+					Throwables.propagate(e); // TODO error handling
+				}
+			}
+		}
 
-            if (client != null) {
-                client.close(); //  ElasticsearchException
-                client = null;
-            }
-        }
+		private IndexRequest newIndexRequest() {
+			return Requests.indexRequest(index).type(type).id(id);
+		}
 
-        @Override
-        public void abort()
-        {
-            //  TODO do nothing
-        }
+		@Override
+		public void finish() {
+			try {
+				bulkProcessor.flush();
+			} finally {
+				close();
+			}
+		}
 
-        @Override
-        public TaskReport commit()
-        {
-            TaskReport report = Exec.newTaskReport();
-            //  TODO
-            return report;
-        }
+		@Override
+		public void close() {
+			if (bulkProcessor != null) {
+				try {
+					while (!bulkProcessor.awaitClose(3, TimeUnit.SECONDS)) {
+						log.debug("wait for closing the bulk processing..");
+					}
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+				}
+				bulkProcessor = null;
+			}
 
-    }
+			if (client != null) {
+				//client.close(); // ElasticsearchException
+				client = null;
+			}
+		}
+
+		@Override
+		public void abort() {
+			// TODO do nothing
+		}
+
+		@Override
+		public TaskReport commit() {
+			TaskReport report = Exec.newTaskReport();
+			// TODO
+			return report;
+		}
+
+	}
 }
